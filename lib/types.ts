@@ -18,7 +18,7 @@ export async function api<T=unknown>(path:string,data?:unknown):Promise<T>{
  const headers:Record<string,string>={};if(data!==undefined)headers['Content-Type']='application/json';if(token)headers.Authorization='Bearer '+token;
  const response=await fetch(API_BASE+path,{method:data===undefined?'GET':'POST',headers,body:data===undefined?undefined:JSON.stringify(data),cache:'no-store'});
  const value=await response.json() as {message?:string;sessionToken?:string;teacherToken?:string};
- if(!response.ok){if(isTeacher&&response.status===401&&path!=='/api/teacher/login'){clearTeacherSession();window.dispatchEvent(new Event('teacher-session-expired'));}throw Object.assign(new Error(value.message||'暫時未能連線，請再試一次。'),{status:response.status});}
+ if(!response.ok){if(isTeacher&&token&&response.status===401&&path!=='/api/teacher/login'){clearTeacherSession();window.dispatchEvent(new Event('teacher-session-expired'));}throw Object.assign(new Error(value.message||'暫時未能連線，請再試一次。'),{status:response.status});}
  if(value.teacherToken)storeTeacherSession(value.teacherToken);
  if(value.sessionToken)saveToken(value.sessionToken);if(path==='/api/student/leave')saveToken('');
  return value as T;
