@@ -1,20 +1,20 @@
 import {checkAnswer,enumerate} from './engine.mjs';
+import {authorizeTeacher,loginTeacher,logoutTeacher,TeacherAuthError} from './teacher-auth.ts';
 type Competition={id:string;code:string;owner_id:string;divisors:string;length:number;cards:string;status:string;created_at:number;started_at:number|null};
 type Participant={id:string;competition_id:string;nickname:string};
 class RequestError extends Error {constructor(public status:number,message:string){super(message);}}
 function json(data:unknown,status=200,headers:Record<string,string>={}){return Response.json(data,{status,headers:{'Cache-Control':'no-store',...headers}});}
 function unpack(row:Competition,showCards=true){return {id:row.id,code:row.code,divisors:JSON.parse(row.divisors),length:row.length,cards:showCards?JSON.parse(row.cards):[],status:row.status,createdAt:row.created_at};}
-function teacher(request:Request,email:string|undefined){const id=request.headers.get('oai-authenticated-user-id'),address=request.headers.get('oai-authenticated-user-email');if(!email||!id||address?.toLowerCase()!==email.toLowerCase())throw new RequestError(403,'只有老師帳戶可以派發或控制比賽。');return id;}
 async function payload(request:Request){if(Number(request.headers.get('content-length')||0)>4096)throw new RequestError(413,'資料過長。');const raw=await request.text();if(raw.length>4096)throw new RequestError(413,'資料過長。');try{return JSON.parse(raw);}catch{throw new RequestError(400,'無法讀取資料，請再試一次。');}}
 async function hash(token:string){const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(token));return Array.from(new Uint8Array(bytes),b=>b.toString(16).padStart(2,'0')).join('');}
 function sessionToken(request:Request){const bearer=request.headers.get('authorization')?.match(/^Bearer ([a-f0-9]{64})$/)?.[1];return bearer||request.headers.get('cookie')?.split(';').map(x=>x.trim()).find(x=>x.startsWith('competition_session='))?.slice('competition_session='.length)||'';}
 function cookie(token:string,request:Request,remove=false){return `competition_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${remove?0:604800}${new URL(request.url).protocol==='https:'?'; Secure':''}`;}
 async function getParticipant(db:D1Database,request:Request){const token=sessionToken(request);if(!/^[a-f0-9]{64}$/.test(token))throw new RequestError(401,'請先輸入參賽代碼加入比賽。');const p=await db.prepare('SELECT id, competition_id, nickname FROM participants WHERE token_hash = ?').bind(await hash(token)).first<Participant>();if(!p)throw new RequestError(401,'請重新加入比賽。');return p;}
 async function studentState(db:D1Database,p:Participant){const c=await db.prepare('SELECT * FROM competitions WHERE id = ?').bind(p.competition_id).first<Competition>();if(!c)throw new RequestError(404,'找不到這場比賽。');const a=await db.prepare('SELECT value FROM answers WHERE participant_id = ? ORDER BY submitted_at, value').bind(p.id).all<{value:string}>();return {competition:unpack(c,c.status!=='waiting'),nickname:p.nickname,accepted:a.results.map(x=>x.value)};}
-async function processCompetition(request:Request,db:D1Database,teacherEmail:string|undefined,studentOrigin?:string){
+async function processCompetition(request:Request,db:D1Database,teacherEmail:string|undefined,studentOrigin?:string,passwordHash?:string){
  try{
  const path=new URL(request.url).pathname,method=request.method;
- const externalStudent=!!studentOrigin&&request.headers.get('origin')===studentOrigin&&path.startsWith('/api/student/');
+ const externalStudent=!!studentOrigin&&request.headers.get('origin')===studentOrigin&&(path.startsWith('/api/student/')||path.startsWith('/api/teacher/'));
  if(method==='POST'&&request.headers.get('origin')!==new URL(request.url).origin&&!externalStudent)throw new RequestError(403,'請從比賽網站提交。');
  if(path==='/api/student/state'&&method==='GET')return json(await studentState(db,await getParticipant(db,request)));
  if(path==='/api/student/leave'&&method==='POST')return json({ok:true},200,{'Set-Cookie':cookie('',request,true)});
@@ -39,7 +39,10 @@ async function processCompetition(request:Request,db:D1Database,teacherEmail:str
   return json({...await studentState(db,p),message:result.message});
  }
  if(path.startsWith('/api/teacher/')){
-  const ownerId=teacher(request,teacherEmail);
+  if(path==='/api/teacher/login'&&method==='POST')return json(await loginTeacher(request,db,(await payload(request)).password,passwordHash,teacherEmail));
+  const ownerId=await authorizeTeacher(request,db,teacherEmail,!!passwordHash);
+  if(path==='/api/teacher/session'&&method==='GET')return json({ok:true});
+  if(path==='/api/teacher/logout'&&method==='POST')return json(await logoutTeacher(request,db));
   if(path==='/api/teacher/competitions'&&method==='GET'){const r=await db.prepare('SELECT * FROM competitions WHERE owner_id = ? ORDER BY created_at DESC LIMIT 30').bind(ownerId).all<Competition>();return json({competitions:r.results.map(c=>unpack(c))});}
   if(path==='/api/teacher/competitions'&&method==='POST'){
    const data=await payload(request),ds=data.divisors,cards=data.cards,length=data.length;
@@ -63,13 +66,13 @@ async function processCompetition(request:Request,db:D1Database,teacherEmail:str
   }
  }
  return json({message:'找不到這個功能。'},404);
- }catch(error){if(error instanceof RequestError)return json({message:error.message},error.status);console.error('Competition request failed',error);return json({message:'暫時未能連線，資料尚未確認儲存。請稍後重試。'},503);}
+ }catch(error){if(error instanceof RequestError||error instanceof TeacherAuthError)return json({message:error.message},error.status);console.error('Competition request failed',error);return json({message:'暫時未能連線，資料尚未確認儲存。請稍後重試。'},503);}
 }
 
-export async function handleCompetition(request:Request,db:D1Database,teacherEmail:string|undefined,studentOrigin?:string){
- const origin=request.headers.get('origin'),external=!!studentOrigin&&origin===studentOrigin&&new URL(request.url).pathname.startsWith('/api/student/');
+export async function handleCompetition(request:Request,db:D1Database,teacherEmail:string|undefined,studentOrigin?:string,passwordHash?:string){
+ const path=new URL(request.url).pathname,origin=request.headers.get('origin'),external=!!studentOrigin&&origin===studentOrigin&&(path.startsWith('/api/student/')||path.startsWith('/api/teacher/'));
  if(request.method==='OPTIONS')return external?new Response(null,{status:204,headers:{'Access-Control-Allow-Origin':studentOrigin!,'Access-Control-Allow-Methods':'GET, POST, OPTIONS','Access-Control-Allow-Headers':'Authorization, Content-Type','Access-Control-Max-Age':'600','Vary':'Origin'}}):json({message:'不允許從這個網站連線。'},403);
- const response=await processCompetition(request,db,teacherEmail,studentOrigin);
+ const response=await processCompetition(request,db,teacherEmail,studentOrigin,passwordHash);
  if(!external)return response;
  const headers=new Headers(response.headers);headers.set('Access-Control-Allow-Origin',studentOrigin!);headers.set('Vary','Origin');return new Response(response.body,{status:response.status,headers});
 }

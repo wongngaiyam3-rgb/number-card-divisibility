@@ -1,4 +1,10 @@
 import {sqliteTable,text,integer,uniqueIndex,primaryKey,index} from 'drizzle-orm/sqlite-core';
+export const teacherSessions=sqliteTable('teacher_sessions',{
+ tokenHash:text('token_hash').primaryKey(),ownerId:text('owner_id').notNull(),expiresAt:integer('expires_at').notNull(),
+},table=>[index('teacher_sessions_expiry').on(table.expiresAt)]);
+export const teacherLoginAttempts=sqliteTable('teacher_login_attempts',{
+ key:text('key').primaryKey(),attempts:integer('attempts').notNull(),windowStarted:integer('window_started').notNull(),
+});
 export const competitions=sqliteTable('competitions',{
  id:text('id').primaryKey(),code:text('code').notNull(),ownerId:text('owner_id').notNull(),divisors:text('divisors').notNull(),length:integer('length').notNull(),cards:text('cards').notNull(),status:text('status').notNull().default('waiting'),createdAt:integer('created_at').notNull(),startedAt:integer('started_at'),
 },table=>[uniqueIndex('competitions_code_unique').on(table.code),index('competitions_owner_created').on(table.ownerId,table.createdAt)]);

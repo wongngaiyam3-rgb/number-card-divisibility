@@ -6,15 +6,16 @@ import {generateRound,enumerate,checkAnswer} from '../lib/engine.mjs';
 const sqlite=new DatabaseSync(':memory:');
 sqlite.exec('PRAGMA foreign_keys=ON');
 for(const file of readdirSync(new URL('../drizzle/',import.meta.url)).filter(x=>x.endsWith('.sql')).sort())sqlite.exec(readFileSync(new URL('../drizzle/'+file,import.meta.url),'utf8'));
-const db={prepare(sql){return {bind(...args){return {async first(){return sqlite.prepare(sql).get(...args)||null;},async all(){return {results:sqlite.prepare(sql).all(...args)};},async run(){const r=sqlite.prepare(sql).run(...args);return {meta:{changes:Number(r.changes)}};}};}};}};
+const statement=(sql,args=[])=>({bind(...values){return statement(sql,values);},async first(){return sqlite.prepare(sql).get(...args)||null;},async all(){return {results:sqlite.prepare(sql).all(...args)};},async run(){const r=sqlite.prepare(sql).run(...args);return {meta:{changes:Number(r.changes)}};}});
+const db={prepare:sql=>statement(sql),async batch(statements){return Promise.all(statements.map(s=>s.run()));}};
 const origin='https://classroom.test',owner='teacher@example.test';
-async function req(path,{method='GET',data,cookie,teacher=false,email=owner,originHeader=origin,cors=false,token}={}){
- const headers={};if(method==='POST')headers.origin=originHeader;if(cookie)headers.cookie=cookie;if(cors||method==='OPTIONS')headers.origin=originHeader;if(token)headers.authorization='Bearer '+token;if(teacher){headers['oai-authenticated-user-id']='teacher-user';headers['oai-authenticated-user-email']=email;}
- const response=await handleCompetition(new Request(origin+path,{method,headers,body:data===undefined?undefined:JSON.stringify(data)}),db,owner,cors?'https://wongngaiyam3-rgb.github.io':undefined);
+async function req(path,{method='GET',data,cookie,teacher=false,email=owner,originHeader=origin,cors=false,token,passwordConfig,ip}={}){
+ const headers={};if(ip)headers['cf-connecting-ip']=ip;if(method==='POST')headers.origin=originHeader;if(cookie)headers.cookie=cookie;if(cors||method==='OPTIONS')headers.origin=originHeader;if(token)headers.authorization='Bearer '+token;if(teacher){headers['oai-authenticated-user-id']='teacher-user';headers['oai-authenticated-user-email']=email;}
+ const response=await handleCompetition(new Request(origin+path,{method,headers,body:data===undefined?undefined:JSON.stringify(data)}),db,owner,cors?'https://wongngaiyam3-rgb.github.io':undefined,passwordConfig);
  return {status:response.status,allowOrigin:response.headers.get('access-control-allow-origin'),data:response.status===204?null:await response.json(),cookie:response.headers.get('set-cookie')?.split(';')[0]};
 }
-assert.equal((await req('/api/teacher/competitions')).status,403);
-assert.equal((await req('/api/teacher/competitions',{teacher:true,email:'student@example.test'})).status,403);
+assert.equal((await req('/api/teacher/competitions')).status,401);
+assert.equal((await req('/api/teacher/competitions',{teacher:true,email:'student@example.test'})).status,401);
 assert.equal((await req('/api/teacher/competitions',{method:'POST',teacher:true,originHeader:'https://other.test',data:{}})).status,403);
 assert.equal((await req('/api/teacher/competitions',{method:'POST',teacher:true,data:{divisors:[2,2],length:3,cards:[0,2,3,5,7]}})).status,400);
 assert.equal((await req('/api/teacher/competitions',{method:'POST',teacher:true,data:{divisors:[3,10],length:3,cards:[1,2,3,4,5]}})).status,400);
@@ -48,7 +49,7 @@ assert.equal((await req('/api/student/state',{cookie:join.cookie})).data.accepte
 const ghOrigin='https://wongngaiyam3-rgb.github.io';
 assert.equal((await req('/api/student/join',{method:'OPTIONS',cors:true,originHeader:ghOrigin})).status,204);
 assert.equal((await req('/api/student/join',{method:'OPTIONS',cors:true,originHeader:'https://other.test'})).status,403);
-assert.equal((await req('/api/teacher/competitions',{method:'POST',teacher:true,cors:true,originHeader:ghOrigin,data:{}})).status,403);
+assert.equal((await req('/api/teacher/competitions',{method:'POST',teacher:true,cors:true,originHeader:ghOrigin,data:{}})).status,400);
 const crossCreated=await req('/api/teacher/competitions',{method:'POST',teacher:true,data:{divisors:[3,10],length:3,cards:[0,2,3,5,7]}});
 const cross=await req('/api/student/join',{method:'POST',cors:true,originHeader:ghOrigin,data:{code:crossCreated.data.competition.code,nickname:'GH 01'}});
 assert.equal(cross.status,200);assert.equal(cross.allowOrigin,ghOrigin);assert.match(cross.data.sessionToken,/^[a-f0-9]{64}$/);
@@ -66,3 +67,32 @@ assert.ok(!checkAnswer('230',[0,2,3,5,7],3,[2,3]).ok);
 assert.ok(!checkAnswer('235',[0,2,3,5,7],3,[3,5]).ok);
 assert.ok(!checkAnswer('570',[0,2,3,5,7],3,[3,10],['570']).ok);
 console.log(`Passed: teacher authorization, joining, synchronized cards, dual-condition checks, duplicate prevention, pause/resume/end, atomic 3-answer limit, persisted results, ${count} generated rounds.`);
+
+const fixturePassword='classroom-test-secret';
+const salt=new Uint8Array(16).fill(7),bytes=new TextEncoder().encode(fixturePassword);
+const material=await crypto.subtle.importKey('raw',bytes,'PBKDF2',false,['deriveBits']);
+const toHex=b=>Array.from(new Uint8Array(b),x=>x.toString(16).padStart(2,'0')).join('');
+const passwordConfig=JSON.stringify({salt:toHex(salt),hash:toHex(await crypto.subtle.deriveBits({name:'PBKDF2',hash:'SHA-256',salt,iterations:100000},material,256)),iterations:100000});
+const teacherReq=(path,options={})=>req(path,{cors:true,originHeader:ghOrigin,passwordConfig,ip:'teacher-good-ip',...options});
+assert.equal((await teacherReq('/api/teacher/competitions',{teacher:true})).status,401);
+assert.equal((await teacherReq('/api/teacher/login',{method:'OPTIONS'})).status,204);
+assert.equal((await teacherReq('/api/teacher/login',{method:'POST',data:{password:'wrong'},ip:'limited-ip'})).status,401);
+for(let i=0;i<4;i++)assert.equal((await teacherReq('/api/teacher/login',{method:'POST',data:{password:'wrong'},ip:'limited-ip'})).status,401);
+assert.equal((await teacherReq('/api/teacher/login',{method:'POST',data:{password:fixturePassword},ip:'limited-ip'})).status,429);
+const login=await teacherReq('/api/teacher/login',{method:'POST',data:{password:fixturePassword}});
+assert.equal(login.status,200);assert.match(login.data.teacherToken,/^[a-f0-9]{64}$/);
+const teacherToken=login.data.teacherToken;
+assert.equal((await teacherReq('/api/teacher/competitions',{token:teacherToken})).status,200);
+assert.equal((await teacherReq('/api/teacher/competitions',{token})).status,401);
+assert.equal((await req('/api/student/state',{cors:true,originHeader:ghOrigin,token:teacherToken})).status,401);
+const passwordContest=await teacherReq('/api/teacher/competitions',{method:'POST',token:teacherToken,data:{divisors:[3,10],length:3,cards:[0,2,3,5,7]}});
+assert.equal(passwordContest.status,200);
+assert.equal((await teacherReq(`/api/teacher/competitions/${passwordContest.data.competition.id}`,{method:'POST',token:teacherToken,data:{status:'running'}})).status,200);
+assert.equal((await teacherReq('/api/teacher/competitions',{method:'POST',originHeader:'https://other.test',token:teacherToken,data:{}})).status,403);
+assert.equal((await teacherReq('/api/teacher/logout',{method:'POST',token:teacherToken,data:{}})).status,200);
+assert.equal((await teacherReq('/api/teacher/session',{token:teacherToken})).status,401);
+const relogin=await teacherReq('/api/teacher/login',{method:'POST',data:{password:fixturePassword}});
+assert.equal(relogin.status,200);
+sqlite.exec('UPDATE teacher_sessions SET expires_at = 0');
+assert.equal((await teacherReq('/api/teacher/session',{token:relogin.data.teacherToken})).status,401);
+console.log('Passed: teacher password login, failed-password limits, server authorization, separate student/teacher credentials, cross-origin controls, logout revocation and session expiry.');
